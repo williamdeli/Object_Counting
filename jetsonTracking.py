@@ -58,10 +58,8 @@ while True:
                 previousCentroid=prevPosition[track_id]
                 if previousCentroid < roi_bound and currentCentroid >= roi_bound:
                     in_count+=1
-                    # add firebase function here please use dict
                 elif previousCentroid > roi_bound and currentCentroid <= roi_bound:
                     out_count+=1
-                    # add firebase function here please use dict
             prevPosition[track_id]=currentCentroid
 
 
