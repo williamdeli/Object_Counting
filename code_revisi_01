@@ -1,0 +1,214 @@
+import jetson.inference
+import jetson.utils
+import time
+import cv2
+import numpy as np 
+import serial
+import threading
+import os
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+dispInCount = 0
+dispOutCount = 0
+
+
+cred = credentials.Certificate("/home/michelie/code/multithread/project-sps-dbe99-firebase-adminsdk-51l7n-ab91bb6c04.json")
+firebase_admin.initialize_app(cred)
+db = firestore.client()
+doc_ref = db.collection('Class').document('Indomie_Goreng')
+
+
+def jetsonTracking():
+    timeStamp = time.time()
+    fpsFilt = 0
+
+    # Initialize the neural network
+    net = jetson.inference.detectNet(
+        argv=["--model=ssd-mobilenet.onnx", "--labels=labels.txt", "--input-blob=input_0", "--output-cvg=scores", "--output-bbox=boxes"],
+        threshold=0.5
+    )
+
+    # Set tracking parameters
+    net.SetTrackerType("IOU")
+    net.SetTrackingEnabled(True)
+    net.SetTrackingParams(minFrames=3, dropFrames=15, overlapThreshold=0.5)
+
+    # Display window dimensions
+    dispW = 640
+    dispH = 480
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    roi_bound = dispH / 2
+
+    # Counters for tracking objects moving in and out
+    global in_count
+    global out_count
+    in_count = 0
+    out_count = 0
+    global weight1
+    global weight2
+    weight1 = 0
+    weight2 = 0
+    prevPosition = {}
+
+    # Initialize camera
+    cam = cv2.VideoCapture('/dev/video0')
+    cam.set(cv2.CAP_PROP_FRAME_WIDTH, dispW)
+    cam.set(cv2.CAP_PROP_FRAME_HEIGHT, dispH)
+
+    while True:
+        _, img = cam.read()
+        height, width = img.shape[:2]
+
+        frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGBA).astype(np.float32)
+        frame = jetson.utils.cudaFromNumpy(frame)
+        detections = net.Detect(frame, width, height)
+
+        for detect in detections:
+            global ID 
+            ID = detect.ClassID
+            top, left, bottom, right = detect.Top, detect.Left, detect.Bottom, detect.Right
+            item = net.GetClassDesc(ID)
+            track_id = detect.TrackID
+            currentCentroid = detect.Center[1]
+
+            if ID == 1:
+                weight1 = 119
+                weight2 = 139
+                
+           
+            if track_id != -1:
+                if track_id in prevPosition:
+                    previousCentroid = prevPosition[track_id]
+                    if previousCentroid < roi_bound and currentCentroid >= roi_bound:
+                        in_count += 1
+                        
+                    elif previousCentroid > roi_bound and currentCentroid <= roi_bound:
+                        out_count += 1
+
+                prevPosition[track_id] = currentCentroid
+
+            cv2.rectangle(img, (int(left), int(top)), (int(right), int(bottom)), (255, 0, 0), thickness=2)
+            cv2.putText(img, item, (int(left), int(top)), font, 1, (255, 0, 0), 2)
+
+        dt = time.time() - timeStamp
+        timeStamp = time.time()
+        fps = 1 / dt
+        fpsFilt = 0.9 * fpsFilt + 0.1 * fps
+
+        cv2.putText(img, str(round(fpsFilt, 1)) + ' fps', (0, 30), font, 1, (0, 0, 255), 2)
+        # cv2.putText(img, 'In: ' + str(in_count), (0, 60), font, 1, (0, 0, 255), 2)
+        cv2.putText(img, 'In: ' + str(dispInCount), (0, 60), font, 1, (0, 0, 255), 2)
+        cv2.putText(img, 'Out: ' + str(dispOutCount), (0, 90), font, 1, (0, 0, 255), 2)
+        cv2.putText(img, 'weight: ' + str(weight1) + ', ' + str(weight2), (0, 120), font, 1, (0, 0, 255), 2)
+
+        cv2.imshow('detCam', img)
+        cv2.moveWindow('detCam', 0, 0)
+
+        if cv2.waitKey(1) == ord('q'):
+            break
+
+    cam.release()
+    cv2.destroyAllWindows()
+
+def weight(port):
+    # Open the serial port outside the while loop
+    with serial.Serial(port, 9600) as ser:
+        message = bytearray()  # Create an empty bytearray to accumulate the bytes
+        try:
+            while True:
+                # Read a byte from the ESP32
+                byte = ser.read(1)
+                if byte:
+                    message.extend(byte)  # Append the byte to the message bytearray
+                    if byte == b'\n':  # Check if the byte is a newline character
+                        try:
+                            global data 
+                            data = message.decode('utf-8').strip()
+                            print('output :', data)
+                            try:
+                                global data_int
+                                data_int = float(data)
+                            except ValueError:
+                                # Handle the case where data is not a valid integer
+                                print(f"Invalid data for comparison: {data}")
+                        except UnicodeDecodeError:
+                            print("Received a non UTF-8 encoded byte sequence.")
+                        message = bytearray()  # Reset the message bytearray for the next message
+        except KeyboardInterrupt:
+            pass  # Exit on Ctrl+C
+        finally:
+            # Close the serial port
+            ser.close()
+
+def perbandingan():
+    ser = serial.Serial('/dev/ttyTHS1', 9600)
+    global weight1, data, weight2, perbandingancount, dispInCount, dispOutCount, ID, currWeight
+    prevWeight = 0
+    currWeight = 0
+    weight1, weight2 = 0, 0
+    
+    time.sleep(10)
+    while True:
+        perbandingancount = 0
+        currWeight = data_int
+        if weight1 <= currWeight - prevWeight <= weight2:
+            perbandingancount = 1
+            print("jumlah barang yang masuk : ", perbandingancount) 
+        else:
+            print("berat beda")
+
+        if (perbandingancount == 1 and dispInCount < in_count):
+            print("barang masuk: ", ID)
+            dispInCount = in_count
+            # ser.write(b'tare\n')
+            prevWeight = currWeight
+            if ID == 1:
+                update_firestore('Class', 'Indomie_Goreng', {'Harga': 'Rp.2900','item':ID, 'object':'objek terdeteksi', 'quantity' : in_count - out_count})
+            
+        
+        if currWeight - prevWeight < -10.00:
+            perbandingancount = 2
+            # ser.write(b'tare\n')
+            prevWeight = currWeight
+            
+            doc_ref.update({'quantity' : in_count - out_count})
+            
+            
+
+        if (perbandingancount == 2 and dispOutCount < out_count):
+            print("barang keluar: ", ID)
+            dispOutCount = out_count
+            
+
+        print("Current Weight: ", currWeight)
+        time.sleep(1)
+
+def update_firestore(collection, document, data):
+    try:
+        doc_ref = db.collection(collection).document(document)
+        doc_ref.update(data)
+        print(f"Firestore updated: {data}")
+    except Exception as e:
+        print(f"Error updating Firestore: {e}")
+
+
+if __name__ == '__main__':
+    thread1 = threading.Thread(target=jetsonTracking)
+    thread2 = threading.Thread(target=weight, args =('/dev/ttyTHS1',) )
+    thread3 = threading.Thread(target=perbandingan)
+
+
+    thread1.start()
+    thread2.start()
+    thread3.start()
+    
+
+    thread1.join()
+    thread2.join()
+    thread3.join()
+ 
+
+    print("Threads have finished execution.")
+
+
